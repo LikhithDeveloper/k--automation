@@ -1,0 +1,4 @@
+environments:
+  kasm-maintenance:
+    name: Kasm maintenance
+    templateName: Kasm maintenance runner
