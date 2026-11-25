@@ -37,7 +37,7 @@ Use at least one unique host in each tier. Proxies also accept `PROXY_1`. Databa
 - `PROXY1_SUDO_PASSWORD` is optional. Mark it **Sensitive** if supplied. It defaults to the SSH password. With neither password set, the runner uses noninteractive, passwordless sudo.
 - `PROXY1_USER` is optional and overrides `SSH_USER` for that host.
 
-Use the same pattern for `PROXY2_PASSWORD`, `WEB_APP_1_PASSWORD`, `DB_1_PASSWORD`, and the rest of the inventory. Fabric uses SSH passwords to authenticate and answers sudo prompts over the SSH channel. The runner keeps credentials out of command arguments and redacts configured passwords from its logs.
+Use the same pattern for `PROXY2_PASSWORD`, `WEB_APP_1_PASSWORD`, `DB_1_PASSWORD`, and the rest of the inventory. Fabric connects as `SSH_USER` or the per-host override. Every maintenance command sent to a server runs as root through sudo, including status checks, Docker, Kasm, and reboot. The env0 agent runs Python and installs Fabric under its own account. The runner keeps credentials out of command arguments and redacts configured passwords from its logs.
 
 ## Logs, checks, and recovery
 
