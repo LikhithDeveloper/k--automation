@@ -2,6 +2,30 @@ version: 1
 
 deploy:
   steps:
+    terraformPlan:
+      before:
+        - |-
+          case "${KASM_STAGE:-}" in
+            proxy-stop|webapp-stop|db-stop|db-start|webapp-start|proxy-start)
+              printf '[Kasm] Planning stage %s. Host commands run after approval.\n' "$KASM_STAGE"
+              ;;
+            *)
+              printf '[Kasm] ERROR Set KASM_STAGE to this sub-environment alias.\n' >&2
+              exit 1
+              ;;
+          esac
     terraformApply:
       before:
-        - python3 kasm_maintenance.py
+        - |-
+          case "${KASM_STAGE:-}" in
+            proxy-stop)   python3 -B proxy.py stop ;;
+            webapp-stop)  python3 -B webapp.py stop ;;
+            db-stop)      python3 -B db.py stop ;;
+            db-start)     python3 -B db.py start ;;
+            webapp-start) python3 -B webapp.py start ;;
+            proxy-start)  python3 -B proxy.py start ;;
+            *)
+              printf '[Kasm] ERROR Unknown or missing KASM_STAGE.\n' >&2
+              exit 1
+              ;;
+          esac

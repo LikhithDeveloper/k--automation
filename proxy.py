@@ -1,0 +1,340 @@
+"""Proxy entry point and common SSH, Docker, and maintenance functions."""
+
+import json
+import logging
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+
+HOST_PATTERNS = {
+    "proxy": re.compile(r"PROXY_?([1-9][0-9]*)"),
+    "webapp": re.compile(r"WEB_APP_([1-9][0-9]*)"),
+    "db": re.compile(r"DB(?:_?([1-9][0-9]*))?"),
+}
+HOSTNAME = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9.:-]*")
+USERNAME = re.compile(r"[a-zA-Z_][a-zA-Z0-9_.-]*")
+BOOT_ID = re.compile(r"[0-9a-f-]{36}")
+DOCKER_UNITS = ("docker.service", "docker.socket")
+STATE_DIR = "/var/lib/kasm-env0-maintenance"
+STATE_FILE = f"{STATE_DIR}/state.json"
+
+# Pass state as a quoted argument so sudo can use standard input for its password.
+WRITE_STATE = r"""
+set -eu
+umask 077
+temporary=$(mktemp "$2/state.XXXXXX")
+trap 'rm -f -- "$temporary"' EXIT
+printf '%s\n' "$1" > "$temporary"
+mv -f -- "$temporary" "$3"
+"""
+
+
+def log(level, context, message):
+    passwords = {
+        value for name, value in os.environ.items()
+        if name.endswith("_PASSWORD") and value
+    }
+    for password in sorted(passwords, key=len, reverse=True):
+        message = message.replace(password, "[redacted]")
+    logging.log(level, "[%s] %s", context, message)
+
+
+def inventory():
+    groups = {}
+    seen = set()
+    for role, pattern in HOST_PATTERNS.items():
+        indexed = {}
+        for name, value in os.environ.items():
+            match = pattern.fullmatch(name)
+            if not match:
+                continue
+            host = value.strip()
+            user = os.environ.get(f"{name}_USER", os.environ.get("SSH_USER", ""))
+            if not HOSTNAME.fullmatch(host) or not USERNAME.fullmatch(user):
+                raise ValueError(f"Check the hostname and SSH user for {name}")
+            index = int(match[1] or 0)
+            identity = host.lower().rstrip(".")
+            if index in indexed or identity in seen:
+                raise ValueError(f"Duplicate host or index in {name}")
+            seen.add(identity)
+            password = os.environ.get(f"{name}_PASSWORD") or None
+            sudo_password = os.environ.get(f"{name}_SUDO_PASSWORD", password) or None
+            for secret in (password, sudo_password):
+                if secret and (len(secret.encode()) > 1024 or any(c in secret for c in "\r\n")):
+                    raise ValueError(f"Invalid password length or newline in credentials for {name}")
+            indexed[index] = (host, user, password, sudo_password)
+        if not indexed:
+            raise ValueError(f"Configure at least one {role} server")
+        groups[role] = [indexed[index] for index in sorted(indexed)]
+    return groups
+
+
+def run_ssh(args, password, sudo_input):
+    options = dict(input=sudo_input, capture_output=True, text=True,
+                   errors="replace", timeout=180, check=False,
+                   env={name: value for name, value in os.environ.items()
+                        if not name.endswith("_PASSWORD")})
+    if password is None:
+        return subprocess.run(args, **options)
+
+    read_fd, write_fd = os.pipe()
+    try:
+        os.write(write_fd, (password + "\n").encode())
+        os.close(write_fd)
+        write_fd = None
+        # File descriptor transport keeps the SSH password out of process arguments.
+        return subprocess.run(
+            ["sshpass", "-d", str(read_fd), *args], pass_fds=(read_fd,), **options,
+        )
+    finally:
+        if write_fd is not None:
+            os.close(write_fd)
+        os.close(read_fd)
+
+
+def remote(server, label, *command, capture=False, reconnect=False, allowed_exit=()):
+    host, user, password, sudo_password = server
+    sudo = ("sudo", "-n", "--")
+    sudo_input = ""
+    if sudo_password is not None:
+        sudo = ("sudo", "-S", "-p", "", "--")
+        sudo_input = sudo_password + "\n"
+    args = [
+        "ssh", "-T", "-o", f"BatchMode={'no' if password else 'yes'}",
+        "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=10",
+        "-o", "ServerAliveInterval=10", "-o", "ServerAliveCountMax=2",
+        "-o", "NumberOfPasswordPrompts=1",
+    ]
+    if password is not None:
+        args.extend(("-o", "PreferredAuthentications=password,keyboard-interactive"))
+    args.extend(("-l", user, "--", host, shlex.join((*sudo, *command))))
+    log(logging.INFO, host, label)
+    try:
+        result = run_ssh(args, password, sudo_input)
+    except subprocess.TimeoutExpired:
+        if reconnect:
+            log(logging.WARNING, host, f"{label}: SSH timed out, checking reboot status")
+            return None
+        raise RuntimeError(f"{label}: SSH command timed out") from None
+    except OSError as error:
+        raise RuntimeError(f"{label}: could not run SSH ({error.strerror})") from None
+
+    stderr, stdout = result.stderr.strip(), result.stdout.strip()
+    if reconnect and result.returncode == 255:
+        log(logging.WARNING, host, f"{label}: SSH exited 255. {stderr}")
+        return None
+    if stderr:
+        log(logging.ERROR if result.returncode else logging.WARNING, host, stderr)
+    if stdout and (not capture or result.returncode):
+        log(logging.ERROR if result.returncode else logging.INFO, host, stdout)
+    if result.returncode in allowed_exit:
+        log(logging.INFO, host, f"{label}: exit {result.returncode}")
+        return None
+    if result.returncode:
+        raise RuntimeError(f"{label}: exit {result.returncode}")
+    log(logging.INFO, host, f"{label}: completed")
+    return stdout
+
+
+def timeout_seconds(name, default):
+    try:
+        seconds = int(os.environ.get(name, default))
+    except ValueError:
+        raise ValueError(f"{name} must be a positive integer") from None
+    if seconds <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return seconds
+
+
+def poll(server, check, interval, timeout, operation):
+    deadline = time.monotonic() + timeout
+    while True:
+        pending = check()
+        if not pending:
+            log(logging.INFO, server[0], f"Verified {operation}")
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError(f"Timed out waiting for {operation}. {pending}")
+        log(logging.INFO, server[0], f"{pending}. Checking again in {min(interval, remaining):g}s")
+        time.sleep(min(interval, remaining))
+
+
+def containers(server):
+    output = remote(server, "List all Docker containers",
+                    "docker", "container", "ls", "--all", "--quiet", capture=True)
+    ids = output.splitlines()
+    if not ids:
+        return {}
+    records = remote(
+        server, "Inspect Docker container states",
+        "docker", "container", "inspect", "--format",
+        '{"name":{{json .Name}},"state":{{json .State}}}', *ids, capture=True,
+    )
+    return {
+        record["name"].lstrip("/"): record["state"]
+        for record in map(json.loads, records.splitlines())
+    }
+
+
+def read_boot_id(server, reconnect=False):
+    boot_id = remote(server, "Read boot ID", "cat", "/proc/sys/kernel/random/boot_id",
+                     capture=True, reconnect=reconnect)
+    if boot_id is not None and not BOOT_ID.fullmatch(boot_id):
+        raise RuntimeError("Host returned an invalid boot ID")
+    return boot_id
+
+
+def read_state(server):
+    present = remote(server, "Check for a saved maintenance state", "test", "-f", STATE_FILE,
+                     allowed_exit=(1,))
+    if present is None:
+        return None
+    raw = remote(server, "Read saved maintenance state", "cat", STATE_FILE, capture=True)
+    state = json.loads(raw)
+    if (not isinstance(state, dict) or not isinstance(state.get("boot_id"), str)
+            or not BOOT_ID.fullmatch(state["boot_id"])
+            or not isinstance(state.get("containers"), list) or not state["containers"]
+            or not all(isinstance(name, str) and name for name in state["containers"])
+            or type(state.get("complete")) is not bool):
+        raise ValueError("Invalid saved maintenance state")
+    return state
+
+
+def save_state(server, state):
+    remote(server, "Prepare maintenance state directory",
+           "install", "-d", "-m", "0700", STATE_DIR)
+    remote(server, "Save maintenance state", "sh", "-c", WRITE_STATE, "write-state",
+           json.dumps(state), STATE_DIR, STATE_FILE)
+
+
+def verify_docker_inactive(server):
+    for unit in DOCKER_UNITS:
+        status = remote(
+            server, f"Verify {unit} is inactive and masked",
+            "systemctl", "show", "--property=ActiveState,UnitFileState", unit, capture=True,
+        )
+        if not {"ActiveState=inactive", "UnitFileState=masked"}.issubset(status.splitlines()):
+            raise RuntimeError(f"{unit} must be inactive and masked after reboot")
+
+
+def stop(server, stop_timeout, reboot_timeout):
+    current_boot = read_boot_id(server)
+    previous = read_state(server)
+    if previous and not previous["complete"]:
+        if current_boot == previous["boot_id"]:
+            raise RuntimeError("An interrupted shutdown needs recovery before retrying")
+        verify_docker_inactive(server)
+        log(logging.INFO, server[0], "Earlier shutdown already rebooted this host")
+        return
+
+    for action in ("stop", "start"):
+        remote(server, f"Check Kasm {action} script", "test", "-x", f"/opt/kasm/bin/{action}")
+    for unit in DOCKER_UNITS:
+        status = remote(server, f"Check {unit}", "systemctl", "show",
+                        "--property=LoadState,UnitFileState", unit, capture=True)
+        if "LoadState=loaded" not in status.splitlines() or "UnitFileState=masked" in status:
+            raise RuntimeError(f"{unit} must be installed and unmasked")
+    names = sorted(containers(server))
+    if not names:
+        raise RuntimeError("Docker has no containers to verify")
+    save_state(server, {"boot_id": current_boot, "containers": names, "complete": False})
+    remote(server, "Stop Kasm", "/opt/kasm/bin/stop")
+
+    def still_running():
+        active = [
+            f"{name} ({state['Status']})" for name, state in sorted(containers(server).items())
+            if state["Status"] not in {"created", "exited", "dead"}
+        ]
+        if active:
+            return "Containers still active: " + ", ".join(active)
+        return None
+
+    poll(server, still_running, 20, stop_timeout, "all containers have stopped")
+    remote(server, "Mask Docker across reboot", "systemctl", "mask", *DOCKER_UNITS)
+    remote(server, "Request reboot", "systemctl", "--no-block", "reboot", reconnect=True)
+
+    def waiting_for_reboot():
+        boot_id = read_boot_id(server, reconnect=True)
+        if boot_id is None:
+            return "Waiting for SSH after reboot"
+        if boot_id == current_boot:
+            return "Waiting for the boot ID to change"
+        return None
+
+    poll(server, waiting_for_reboot, 10, reboot_timeout, "host has rebooted")
+    verify_docker_inactive(server)
+
+
+def start(server, start_timeout):
+    state = read_state(server)
+    if state is None or read_boot_id(server) == state["boot_id"]:
+        raise RuntimeError("Startup requires a saved shutdown and a verified reboot")
+    expected = set(state["containers"])
+    if not state["complete"]:
+        remote(server, "Unmask Docker", "systemctl", "unmask", *DOCKER_UNITS)
+        remote(server, "Start Docker", "systemctl", "start", "docker")
+        remote(server, "Start Kasm", "/opt/kasm/bin/start")
+
+    def unhealthy():
+        states = containers(server)
+        waiting = [f"{name} (missing)" for name in sorted(expected - states.keys())]
+        for name, status in sorted(states.items()):
+            health = status.get("Health", {}).get("Status")
+            if status["Status"] != "running":
+                waiting.append(f"{name} ({status['Status']})")
+            elif health is not None and health != "healthy":
+                waiting.append(f"{name} ({health})")
+        if waiting:
+            return "Containers not ready: " + ", ".join(waiting)
+        return None
+
+    poll(server, unhealthy, 30, start_timeout, "all containers are ready")
+    if not state["complete"]:
+        state["complete"] = True
+        save_state(server, state)
+
+
+def main(role):
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    context = role
+    try:
+        if len(sys.argv) != 2 or sys.argv[1] not in {"stop", "start"}:
+            raise ValueError(f"Usage: python3 {sys.argv[0]} stop|start")
+        action = sys.argv[1]
+        context = f"{role} {action}"
+        groups = inventory()
+        servers = groups[role]
+        if not shutil.which("ssh"):
+            raise RuntimeError("Install OpenSSH on the env0 agent")
+        if any(server[2] for server in servers) and not shutil.which("sshpass"):
+            raise RuntimeError("Install sshpass on the env0 agent for password authentication")
+        stop_timeout = timeout_seconds("KASM_STOP_TIMEOUT_SECONDS", 600)
+        reboot_timeout = timeout_seconds("KASM_REBOOT_TIMEOUT_SECONDS", 600)
+        start_timeout = timeout_seconds("KASM_START_TIMEOUT_SECONDS", 900)
+        log(logging.INFO, context, f"Stage started for {len(servers)} hosts")
+        for server in servers:
+            context = f"{role} {action} {server[0]}"
+            log(logging.INFO, context, "Host started")
+            if action == "stop":
+                stop(server, stop_timeout, reboot_timeout)
+            else:
+                start(server, start_timeout)
+            log(logging.INFO, context, "Host completed")
+        log(logging.INFO, f"{role} {action}", "Stage completed")
+        return 0
+    except KeyboardInterrupt:
+        log(logging.ERROR, context, "Stage interrupted. Check maintenance state before retrying.")
+        return 130
+    except Exception as error:
+        log(logging.ERROR, context, f"{type(error).__name__}: {error}")
+        log(logging.ERROR, context, "Stage failed. Check the affected host before retrying.")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main("proxy"))
