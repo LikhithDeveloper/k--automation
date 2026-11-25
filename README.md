@@ -1,4 +1,4 @@
-# Kasm maintenance in env0
+# Kasm maintenance in env0 with PowerShell
 
 The workflow takes the fleet offline during a maintenance window. Every stage waits for its own **Approve** action in env0 before running any server commands. Within a stage, hosts run one at a time in numeric order.
 
@@ -13,10 +13,10 @@ The workflow takes the fleet offline during a maintenance window. Every stage wa
 
 ## env0 setup
 
-1. Create a Terraform template named **Kasm maintenance runner** with this repository's root as its template directory. Select Terraform 1.5 or later. The plan changes a timestamp in Terraform state so env0 has an Apply to approve on every run. The template provisions no infrastructure.
-2. Create an **env0 Workflow** template pointing to the same repository root. The workflow declares the six dependencies and sets `requiresApproval: true` on each stage.
+1. Create a Terraform template named **Kasm maintenance PowerShell runner** with this repository's root as its template directory. Select the `powershell-maintenance` branch and Terraform 1.5 or later. The plan changes a timestamp in Terraform state so env0 has an Apply to approve on every run. The template provisions no infrastructure.
+2. Create an **env0 Workflow** template pointing to the same branch and repository root. The workflow declares the six dependencies and sets `requiresApproval: true` on each stage. The Apply hook calls `proxy.ps1`, `webapp.ps1`, or `db.ps1`, which share the functions in `Maintenance.ps1`.
 3. In the workflow template's variables, set a separate `KASM_STAGE` **environment variable** for each sub-environment. Its value must exactly match the sub-environment alias from the table. Add the shared server and credential variables below at workflow scope so all six stages receive them.
-4. Use an env0 agent with Python 3.9+, `venv`, and network access to the hosts and Python package index. The Apply hook installs Fabric from `requirements.txt` in a temporary virtual environment. Add verified host keys to `~/.ssh/known_hosts` or `/etc/ssh/ssh_known_hosts` on the agent. The servers need systemd-managed `docker.service` and `docker.socket`, plus sudo access for the configured SSH account.
+4. Use an env0 agent that can reach the servers over SSH and has PowerShell 7.4 or later and Posh-SSH 4.0.0 available under the agent account. To install the module under that account, run `Install-Module Posh-SSH -RequiredVersion 4.0.0 -Scope CurrentUser` from PowerShell. Add verified host keys to an OpenSSH `known_hosts` file on the agent. The runner uses `SSH_KNOWN_HOSTS` if set, otherwise `~/.ssh/known_hosts` or `/etc/ssh/ssh_known_hosts`. The Linux servers need systemd-managed `docker.service` and `docker.socket`, plus sudo access for the configured SSH account.
 5. Disable continuous deployment and automatic remediation for the maintenance environment. Start the workflow manually and keep manual approval enabled for all six sub-environments in the deployment settings. Review the stage name before approving it. Use one maintenance run at a time for the same hosts.
 
 ## Environment variables
@@ -33,11 +33,12 @@ The workflow takes the fleet offline during a maintenance window. Every stage wa
 
 Use at least one unique host in each tier. Proxies also accept `PROXY_1`. Databases accept `DB1` or an unnumbered `DB`, which sorts first. For a host variable such as `PROXY1`, add credentials using the same prefix.
 
-- `PROXY1_PASSWORD` is the SSH password. Mark it **Sensitive** in env0. Leave it unset to use the agent's SSH key.
+- `PROXY1_PASSWORD` is the SSH password. Mark it **Sensitive** in env0. Leave it unset to use an SSH private key file on the agent.
 - `PROXY1_SUDO_PASSWORD` is optional. Mark it **Sensitive** if supplied. It defaults to the SSH password. With neither password set, the runner uses noninteractive, passwordless sudo.
 - `PROXY1_USER` is optional and overrides `SSH_USER` for that host.
+- `PROXY1_KEY_FILE` is optional and overrides `SSH_KEY_FILE`. If neither is set, the runner looks for `id_ed25519`, `id_ecdsa`, then `id_rsa` in the agent account's `~/.ssh` directory. For an encrypted key, set `PROXY1_KEY_PASSPHRASE` or `SSH_KEY_PASSPHRASE` as a **Sensitive** variable.
 
-Use the same pattern for `PROXY2_PASSWORD`, `WEB_APP_1_PASSWORD`, `DB_1_PASSWORD`, and the rest of the inventory. Fabric connects as `SSH_USER` or the per-host override. Every maintenance command sent to a server runs as root through sudo, including status checks, Docker, Kasm, and reboot. The env0 agent runs Python and installs Fabric under its own account. The runner keeps credentials out of command arguments and redacts configured passwords from its logs.
+Use the same pattern for `PROXY2_PASSWORD`, `WEB_APP_1_PASSWORD`, `DB_1_PASSWORD`, and the rest of the inventory. Posh-SSH connects as `SSH_USER` or the per-host override. Every maintenance command sent to a server runs as root through sudo, including status checks, Docker, Kasm, and reboot. PowerShell and Posh-SSH run on the env0 agent. The runner sends sudo passwords over SSH stdin and redacts configured secrets from its logs.
 
 ## Logs, checks, and recovery
 

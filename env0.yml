@@ -19,20 +19,15 @@ deploy:
         - |-
           set -eu
           case "${KASM_STAGE:-}" in
-            proxy-stop)   set -- proxy.py stop ;;
-            webapp-stop)  set -- webapp.py stop ;;
-            db-stop)      set -- db.py stop ;;
-            db-start)     set -- db.py start ;;
-            webapp-start) set -- webapp.py start ;;
-            proxy-start)  set -- proxy.py start ;;
+            proxy-stop)   set -- proxy.ps1 -Action stop ;;
+            webapp-stop)  set -- webapp.ps1 -Action stop ;;
+            db-stop)      set -- db.ps1 -Action stop ;;
+            db-start)     set -- db.ps1 -Action start ;;
+            webapp-start) set -- webapp.ps1 -Action start ;;
+            proxy-start)  set -- proxy.ps1 -Action start ;;
             *)
               printf '[Kasm] ERROR Unknown or missing KASM_STAGE.\n' >&2
               exit 1
               ;;
           esac
-          printf '[Kasm] Installing Fabric for %s\n' "$KASM_STAGE"
-          kasm_venv="$(mktemp -d)"
-          trap 'rm -rf -- "$kasm_venv"' EXIT
-          python3 -m venv "$kasm_venv"
-          "$kasm_venv/bin/python" -m pip --disable-pip-version-check install --no-input -r requirements.txt
-          "$kasm_venv/bin/python" -B "$@"
+          pwsh -NoLogo -NoProfile -NonInteractive -File "$@"
