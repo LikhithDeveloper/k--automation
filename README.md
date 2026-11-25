@@ -16,7 +16,7 @@ The workflow takes the fleet offline during a maintenance window. Every stage wa
 1. Create a Terraform template named **Kasm maintenance runner** with this repository's root as its template directory. Select Terraform 1.5 or later. The plan changes a timestamp in Terraform state so env0 has an Apply to approve on every run. The template provisions no infrastructure.
 2. Create an **env0 Workflow** template pointing to the same repository root. The workflow declares the six dependencies and sets `requiresApproval: true` on each stage.
 3. In the workflow template's variables, set a separate `KASM_STAGE` **environment variable** for each sub-environment. Its value must exactly match the sub-environment alias from the table. Add the shared server and credential variables below at workflow scope so all six stages receive them.
-4. Use an env0 agent with Python 3.9+, OpenSSH, network access to the hosts, and verified host keys in its `known_hosts`. Install `sshpass` on the agent if using SSH passwords. The servers need systemd-managed `docker.service` and `docker.socket`, plus sudo access for the configured SSH account.
+4. Use an env0 agent with Python 3.9+, `venv`, and network access to the hosts and Python package index. The Apply hook installs Fabric from `requirements.txt` in a temporary virtual environment. Add verified host keys to `~/.ssh/known_hosts` or `/etc/ssh/ssh_known_hosts` on the agent. The servers need systemd-managed `docker.service` and `docker.socket`, plus sudo access for the configured SSH account.
 5. Disable continuous deployment and automatic remediation for the maintenance environment. Start the workflow manually and keep manual approval enabled for all six sub-environments in the deployment settings. Review the stage name before approving it. Use one maintenance run at a time for the same hosts.
 
 ## Environment variables
@@ -37,7 +37,7 @@ Use at least one unique host in each tier. Proxies also accept `PROXY_1`. Databa
 - `PROXY1_SUDO_PASSWORD` is optional. Mark it **Sensitive** if supplied. It defaults to the SSH password. With neither password set, the runner uses noninteractive, passwordless sudo.
 - `PROXY1_USER` is optional and overrides `SSH_USER` for that host.
 
-Use the same pattern for `PROXY2_PASSWORD`, `WEB_APP_1_PASSWORD`, `DB_1_PASSWORD`, and the rest of the inventory. All remote maintenance commands use sudo. The runner passes SSH passwords by file descriptor and sudo passwords through SSH stdin. Passwords belong in env0's sensitive variables.
+Use the same pattern for `PROXY2_PASSWORD`, `WEB_APP_1_PASSWORD`, `DB_1_PASSWORD`, and the rest of the inventory. Fabric uses SSH passwords to authenticate and answers sudo prompts over the SSH channel. The runner keeps credentials out of command arguments and redacts configured passwords from its logs.
 
 ## Logs, checks, and recovery
 

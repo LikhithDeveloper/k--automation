@@ -17,15 +17,22 @@ deploy:
     terraformApply:
       before:
         - |-
+          set -eu
           case "${KASM_STAGE:-}" in
-            proxy-stop)   python3 -B proxy.py stop ;;
-            webapp-stop)  python3 -B webapp.py stop ;;
-            db-stop)      python3 -B db.py stop ;;
-            db-start)     python3 -B db.py start ;;
-            webapp-start) python3 -B webapp.py start ;;
-            proxy-start)  python3 -B proxy.py start ;;
+            proxy-stop)   set -- proxy.py stop ;;
+            webapp-stop)  set -- webapp.py stop ;;
+            db-stop)      set -- db.py stop ;;
+            db-start)     set -- db.py start ;;
+            webapp-start) set -- webapp.py start ;;
+            proxy-start)  set -- proxy.py start ;;
             *)
               printf '[Kasm] ERROR Unknown or missing KASM_STAGE.\n' >&2
               exit 1
               ;;
           esac
+          printf '[Kasm] Installing Fabric for %s\n' "$KASM_STAGE"
+          kasm_venv="$(mktemp -d)"
+          trap 'rm -rf -- "$kasm_venv"' EXIT
+          python3 -m venv "$kasm_venv"
+          "$kasm_venv/bin/python" -m pip --disable-pip-version-check install --no-input -r requirements.txt
+          "$kasm_venv/bin/python" -B "$@"

@@ -5,10 +5,13 @@ import logging
 import os
 import re
 import shlex
-import shutil
-import subprocess
 import sys
 import time
+from pathlib import Path
+
+from fabric import Config, Connection
+from invoke.exceptions import AuthFailure, CommandTimedOut, ThreadException
+from paramiko import RejectPolicy, SSHException
 
 HOST_PATTERNS = {
     "proxy": re.compile(r"PROXY_?([1-9][0-9]*)"),
@@ -21,6 +24,7 @@ BOOT_ID = re.compile(r"[0-9a-f-]{36}")
 DOCKER_UNITS = ("docker.service", "docker.socket")
 STATE_DIR = "/var/lib/kasm-env0-maintenance"
 STATE_FILE = f"{STATE_DIR}/state.json"
+SUDO_PROMPT = "[kasm-maintenance] sudo password: "
 
 # Pass state as a quoted argument so sudo can use standard input for its password.
 WRITE_STATE = r"""
@@ -73,71 +77,78 @@ def inventory():
     return groups
 
 
-def run_ssh(args, password, sudo_input):
-    options = dict(input=sudo_input, capture_output=True, text=True,
-                   errors="replace", timeout=180, check=False,
-                   env={name: value for name, value in os.environ.items()
-                        if not name.endswith("_PASSWORD")})
-    if password is None:
-        return subprocess.run(args, **options)
+def run_ssh(server, command):
+    host, user, password, sudo_password = server
+    connect_kwargs = {"banner_timeout": 10, "auth_timeout": 10, "channel_timeout": 10}
+    if password is not None:
+        connect_kwargs.update(password=password, allow_agent=False, look_for_keys=False)
+    config = Config(overrides={"sudo": {"prompt": SUDO_PROMPT}})
+    options = dict(hide=True, warn=True, echo=False, pty=False, in_stream=False, timeout=180)
 
-    read_fd, write_fd = os.pipe()
-    try:
-        os.write(write_fd, (password + "\n").encode())
-        os.close(write_fd)
-        write_fd = None
-        # File descriptor transport keeps the SSH password out of process arguments.
-        return subprocess.run(
-            ["sshpass", "-d", str(read_fd), *args], pass_fds=(read_fd,), **options,
-        )
-    finally:
-        if write_fd is not None:
-            os.close(write_fd)
-        os.close(read_fd)
+    with Connection(host, user=user, config=config, connect_timeout=10,
+                    connect_kwargs=connect_kwargs, forward_agent=False) as connection:
+        # Fabric accepts unknown keys by default. Require a verified key instead.
+        connection.client.set_missing_host_key_policy(RejectPolicy())
+        connection.client.load_system_host_keys()
+        system_hosts = Path("/etc/ssh/ssh_known_hosts")
+        if system_hosts.is_file():
+            connection.client.load_system_host_keys(str(system_hosts))
+        try:
+            connection.open()
+        except Exception:
+            connection.client.close()
+            raise
+        connection.transport.set_keepalive(10)
+        quoted_command = shlex.join(command)
+        if sudo_password is None:
+            return connection.run(f"sudo -n -- {quoted_command}", **options)
+        return connection.sudo(f"-- {quoted_command}", password=sudo_password, user=None, **options)
 
 
 def remote(server, label, *command, capture=False, reconnect=False, allowed_exit=()):
-    host, user, password, sudo_password = server
-    sudo = ("sudo", "-n", "--")
-    sudo_input = ""
-    if sudo_password is not None:
-        sudo = ("sudo", "-S", "-p", "", "--")
-        sudo_input = sudo_password + "\n"
-    args = [
-        "ssh", "-T", "-o", f"BatchMode={'no' if password else 'yes'}",
-        "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=10",
-        "-o", "ServerAliveInterval=10", "-o", "ServerAliveCountMax=2",
-        "-o", "NumberOfPasswordPrompts=1",
-    ]
-    if password is not None:
-        args.extend(("-o", "PreferredAuthentications=password,keyboard-interactive"))
-    args.extend(("-l", user, "--", host, shlex.join((*sudo, *command))))
+    host = server[0]
     log(logging.INFO, host, label)
     try:
-        result = run_ssh(args, password, sudo_input)
-    except subprocess.TimeoutExpired:
-        if reconnect:
-            log(logging.WARNING, host, f"{label}: SSH timed out, checking reboot status")
+        result = run_ssh(server, command)
+    except AuthFailure:
+        raise RuntimeError(f"{label}: sudo rejected the password") from None
+    except (CommandTimedOut, EOFError, OSError, SSHException, ThreadException) as error:
+        detail = str(error) if not isinstance(error, ThreadException) else ", ".join(
+            f"{item.type.__name__}: {item.value}" for item in error.exceptions
+        )
+        message = f"{label}: {type(error).__name__}: {detail}"
+        if reconnect and is_reboot_disconnect(error):
+            log(logging.WARNING, host, message)
             return None
-        raise RuntimeError(f"{label}: SSH command timed out") from None
-    except OSError as error:
-        raise RuntimeError(f"{label}: could not run SSH ({error.strerror})") from None
+        raise RuntimeError(message) from None
 
-    stderr, stdout = result.stderr.strip(), result.stdout.strip()
-    if reconnect and result.returncode == 255:
-        log(logging.WARNING, host, f"{label}: SSH exited 255. {stderr}")
+    stderr = result.stderr.replace(SUDO_PROMPT, "").strip()
+    stdout = result.stdout.strip()
+    if reconnect and result.exited == -1:
+        log(logging.WARNING, host, f"{label}: SSH closed before returning an exit status. {stderr}")
         return None
     if stderr:
-        log(logging.ERROR if result.returncode else logging.WARNING, host, stderr)
-    if stdout and (not capture or result.returncode):
-        log(logging.ERROR if result.returncode else logging.INFO, host, stdout)
-    if result.returncode in allowed_exit:
-        log(logging.INFO, host, f"{label}: exit {result.returncode}")
+        log(logging.ERROR if result.exited else logging.WARNING, host, stderr)
+    if stdout and (not capture or result.exited):
+        log(logging.ERROR if result.exited else logging.INFO, host, stdout)
+    if result.exited in allowed_exit:
+        log(logging.INFO, host, f"{label}: exit {result.exited}")
         return None
-    if result.returncode:
-        raise RuntimeError(f"{label}: exit {result.returncode}")
+    if result.exited:
+        raise RuntimeError(f"{label}: exit {result.exited}")
     log(logging.INFO, host, f"{label}: completed")
     return stdout
+
+
+def is_reboot_disconnect(error):
+    if isinstance(error, (CommandTimedOut, EOFError, OSError)):
+        return True
+    if type(error) is SSHException:
+        return str(error).startswith(("Error reading SSH protocol banner", "SSH session not active",
+                                      "Channel closed."))
+    if isinstance(error, ThreadException):
+        return all(is_reboot_disconnect(item.value) for item in error.exceptions)
+    return False
 
 
 def timeout_seconds(name, default):
@@ -301,6 +312,7 @@ def start(server, start_timeout):
 
 def main(role):
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logging.getLogger("paramiko").setLevel(logging.CRITICAL)
     context = role
     try:
         if len(sys.argv) != 2 or sys.argv[1] not in {"stop", "start"}:
@@ -309,10 +321,6 @@ def main(role):
         context = f"{role} {action}"
         groups = inventory()
         servers = groups[role]
-        if not shutil.which("ssh"):
-            raise RuntimeError("Install OpenSSH on the env0 agent")
-        if any(server[2] for server in servers) and not shutil.which("sshpass"):
-            raise RuntimeError("Install sshpass on the env0 agent for password authentication")
         stop_timeout = timeout_seconds("KASM_STOP_TIMEOUT_SECONDS", 600)
         reboot_timeout = timeout_seconds("KASM_REBOOT_TIMEOUT_SECONDS", 600)
         start_timeout = timeout_seconds("KASM_START_TIMEOUT_SECONDS", 900)
