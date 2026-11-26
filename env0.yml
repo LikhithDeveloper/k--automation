@@ -2,37 +2,12 @@ version: 1
 
 deploy:
   steps:
-    terraformPlan:
-      before:
-        - |-
-          case "${KASM_STAGE:-}" in
-            proxy-stop|webapp-stop|db-stop|db-start|webapp-start|proxy-start)
-              printf '[Kasm] Planning stage %s. Host commands run after approval.\n' "$KASM_STAGE"
-              ;;
-            *)
-              printf '[Kasm] ERROR Set KASM_STAGE to this sub-environment alias.\n' >&2
-              exit 1
-              ;;
-          esac
     terraformApply:
       before:
         - |-
           set -eu
-          case "${KASM_STAGE:-}" in
-            proxy-stop)   set -- proxy.py stop ;;
-            webapp-stop)  set -- webapp.py stop ;;
-            db-stop)      set -- db.py stop ;;
-            db-start)     set -- db.py start ;;
-            webapp-start) set -- webapp.py start ;;
-            proxy-start)  set -- proxy.py start ;;
-            *)
-              printf '[Kasm] ERROR Unknown or missing KASM_STAGE.\n' >&2
-              exit 1
-              ;;
-          esac
-          printf '[Kasm] Installing Fabric for %s\n' "$KASM_STAGE"
           kasm_venv="$(mktemp -d)"
           trap 'rm -rf -- "$kasm_venv"' EXIT
           python3 -m venv "$kasm_venv"
           "$kasm_venv/bin/python" -m pip --disable-pip-version-check install --no-input -r requirements.txt
-          "$kasm_venv/bin/python" -B "$@"
+          "$kasm_venv/bin/python" -u maintenance.py
