@@ -1,62 +1,16 @@
-# Kasm maintenance in env0 with PowerShell
+# Kasm maintenance in env0
 
-The workflow takes the fleet offline during a maintenance window. Every stage waits for its own **Approve** action in env0 before running any server commands. Within a stage, hosts run one at a time in numeric order.
+Point a Terraform template named **Kasm maintenance PowerShell runner** at the root of the `powershell-maintenance` branch using Terraform 1.5 or later. The template changes a timestamp in Terraform state so Apply runs each time. To use an env0 Workflow template, point it at the same branch and directory. The workflow runs the maintenance script during Apply.
 
-| Order | env0 sub-environment alias | Action |
-| --- | --- | --- |
-| 1 | `proxy-stop` | Stop and reboot proxies |
-| 2 | `webapp-stop` | Stop and reboot web apps |
-| 3 | `db-stop` | Stop and reboot databases |
-| 4 | `db-start` | Start databases |
-| 5 | `webapp-start` | Start web apps |
-| 6 | `proxy-start` | Start proxies |
+Set these env0 environment variables. Each numbered variable contains one hostname or IP address.
 
-## env0 setup
-
-1. Create a Terraform template named **Kasm maintenance PowerShell runner** with this repository's root as its template directory. Select the `powershell-maintenance` branch and Terraform 1.5 or later. The plan changes a timestamp in Terraform state so env0 has an Apply to approve on every run. The template provisions no infrastructure.
-2. Create an **env0 Workflow** template pointing to the same branch and repository root. The workflow declares the six dependencies and sets `requiresApproval: true` on each stage. The Apply hook calls `proxy.ps1`, `webapp.ps1`, or `db.ps1`, which share the functions in `Maintenance.ps1`.
-3. In the workflow template's variables, set a separate `KASM_STAGE` **environment variable** for each sub-environment. Its value must exactly match the sub-environment alias from the table. Add the shared server and credential variables below at workflow scope so all six stages receive them.
-4. Use an env0 agent that can reach the servers over SSH and has PowerShell 7.4 or later and Posh-SSH 4.0.0 available under the agent account. To install the module under that account, run `Install-Module Posh-SSH -RequiredVersion 4.0.0 -Scope CurrentUser` from PowerShell. Add verified host keys to an OpenSSH `known_hosts` file on the agent. The runner uses `SSH_KNOWN_HOSTS` if set, otherwise `~/.ssh/known_hosts` or `/etc/ssh/ssh_known_hosts`. The Linux servers need systemd-managed `docker.service` and `docker.socket`, plus sudo access for the configured SSH account.
-5. Disable continuous deployment and automatic remediation for the maintenance environment. Start the workflow manually and keep manual approval enabled for all six sub-environments in the deployment settings. Review the stage name before approving it. Use one maintenance run at a time for the same hosts.
-
-## Environment variables
-
-| Variable | Example value |
+| Variable | Example |
 | --- | --- |
 | `SSH_USER` | `maintenance` |
-| `PROXY1` | `proxy-01.internal` |
-| `PROXY2` | `proxy-02.internal` |
-| `WEB_APP_1` | `web-01.internal` |
-| `WEB_APP_2` | `web-02.internal` |
-| `DB_1` | `db-01.internal` |
-| `DB_2` | `db-02.internal` |
+| `PROXY1`, `PROXY2` | `proxy-01`, `proxy-02` |
+| `WEB_APP_1`, `WEB_APP_2` | `web-01`, `web-02` |
+| `DB_1`, `DB_2` | `db-01`, `db-02` |
 
-Use at least one unique host in each tier. Proxies also accept `PROXY_1`. Databases accept `DB1` or an unnumbered `DB`, which sorts first. For a host variable such as `PROXY1`, add credentials using the same prefix.
+An unnumbered `DB` also works and runs before numbered database servers. The env0 agent needs PowerShell, OpenSSH, a trusted host key for each server, and an SSH key for `SSH_USER`. Every remote command runs as root through passwordless sudo.
 
-- `PROXY1_PASSWORD` is the SSH password. Mark it **Sensitive** in env0. Leave it unset to use an SSH private key file on the agent.
-- `PROXY1_SUDO_PASSWORD` is optional. Mark it **Sensitive** if supplied. It defaults to the SSH password. With neither password set, the runner uses noninteractive, passwordless sudo.
-- `PROXY1_USER` is optional and overrides `SSH_USER` for that host.
-- `PROXY1_KEY_FILE` is optional and overrides `SSH_KEY_FILE`. If neither is set, the runner looks for `id_ed25519`, `id_ecdsa`, then `id_rsa` in the agent account's `~/.ssh` directory. For an encrypted key, set `PROXY1_KEY_PASSPHRASE` or `SSH_KEY_PASSPHRASE` as a **Sensitive** variable.
-
-Use the same pattern for `PROXY2_PASSWORD`, `WEB_APP_1_PASSWORD`, `DB_1_PASSWORD`, and the rest of the inventory. Posh-SSH connects as `SSH_USER` or the per-host override. Every maintenance command sent to a server runs as root through sudo, including status checks, Docker, Kasm, and reboot. PowerShell and Posh-SSH run on the env0 agent. The runner sends sudo passwords over SSH stdin and redacts configured secrets from its logs.
-
-## Logs, checks, and recovery
-
-The Apply log shows timestamped stage and host progress, each command's outcome, service command output, retry reasons, and failures. A failure exits the stage with an error and prevents dependent stages from running. Plan-only and destroy runs do not run maintenance.
-
-The stop stage records container names and the host's boot ID in the root-only `/var/lib/kasm-env0-maintenance/state.json`, runs `/opt/kasm/bin/stop`, and checks for stopped containers every 20 seconds. It then masks the Docker service and socket, reboots, and confirms a new boot ID with both units inactive and masked. The mask persists while env0 waits for later approvals.
-
-The start stage reads the saved inventory, unmasks Docker, starts Docker and Kasm, and checks every 30 seconds for all expected containers. Every container must be running, and containers with health checks must be healthy. Optional per-host limits are `KASM_STOP_TIMEOUT_SECONDS` (600), `KASM_REBOOT_TIMEOUT_SECONDS` (600), and `KASM_START_TIMEOUT_SECONDS` (900).
-
-If a stage fails, inspect its log and the state of the hosts it already touched. After a verified reboot, a retry of the stop stage can recognize hosts that are still masked. A retry of the start stage rechecks hosts whose startup already completed. If a host was interrupted before reboot, inspect and recover it before retrying. Check any pending reboot before changing its Docker units.
-
-If abandoning the run, recover affected hosts in database, web app, then proxy order. On each affected host, run the following and verify container health before proceeding to the next host.
-
-```sh
-sudo systemctl unmask docker.service docker.socket
-sudo systemctl start docker
-sudo /opt/kasm/bin/start
-sudo docker ps -a
-```
-
-After confirming manual recovery, remove that host's stale `/var/lib/kasm-env0-maintenance/state.json` with sudo before starting a new maintenance run.
+The script stops and reboots proxies, web apps, and databases in that order, one host at a time. Docker is masked across reboot so it stays off until its startup turn. Then the script starts Docker and Kasm in database, web app, and proxy order. It polls every 20 seconds on shutdown and every 30 seconds on startup. Containers with a Docker health check must be healthy. Other containers must be running.
